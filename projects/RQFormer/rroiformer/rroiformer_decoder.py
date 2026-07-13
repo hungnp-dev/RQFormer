@@ -255,7 +255,8 @@ class RRoIFormerDecoder(CascadeRoIHead):
         bbox_feats = bbox_roi_extractor(x[:bbox_roi_extractor.num_inputs],
                                         rois)   # N1+N2, 256, 7, 7
         cls_score, bbox_pred, query, attn_feats = bbox_head(
-            bbox_feats, query, query_pos, batch_start_index)   # [N1+N2, 15], [N1+N2, 5], [N1+N2, 256], [N1+N2, 256]
+            bbox_feats, query, query_pos, batch_start_index, rois=rois,
+            batch_img_metas=batch_img_metas)   # [N1+N2, 15], [N1+N2, 5], [N1+N2, 256], [N1+N2, 256]
 
         fake_bbox_results = dict(
             rois=rois,
@@ -664,3 +665,4 @@ class RRoIFormerDecoder(CascadeRoIHead):
                 all_stage_bbox_results.append((bbox_res,))
 
         return tuple(all_stage_bbox_results)
+
