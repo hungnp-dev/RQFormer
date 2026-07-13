@@ -75,8 +75,9 @@ setup_env() {
 
 latest_ckpt() {
   local dir="$1"
+  [[ -d "$dir" ]] || return 0
   [[ -f "$dir/latest.pth" ]] && { echo "$dir/latest.pth"; return 0; }
-  find "$dir" -maxdepth 1 -type f -name 'epoch_*.pth' 2>/dev/null | sort -V | tail -n 1
+  find "$dir" -maxdepth 1 -type f -name 'epoch_*.pth' 2>/dev/null | sort -V | tail -n 1 || true
 }
 
 resolve_ckpt() {
