@@ -84,6 +84,7 @@ class RRoIFormerDecoderLayer(BBoxHead):
             nn.ReLU(inplace=True),
             nn.Linear(self.embed_dims, 1))
         self.geometry_relation_dropout = nn.Dropout(dropout)
+        self.geometry_relation_scale = nn.Parameter(torch.zeros(1))
 
         self.rroi_attn = MODELS.build(rroi_attn_cfg)
         self.rroi_attn_dropout = nn.Dropout(dropout)
@@ -150,7 +151,7 @@ class RRoIFormerDecoderLayer(BBoxHead):
         relation_bias = self.geometry_relation(relation_feat).squeeze(-1)
         relation_weight = relation_bias.softmax(dim=-1)
         relation_context = torch.matmul(relation_weight, query)
-        return query + self.geometry_relation_dropout(relation_context)
+        return query + self.geometry_relation_scale * self.geometry_relation_dropout(relation_context)
 
     def init_weights(self) -> None:
         """Use xavier initialization for all weight parameter and set

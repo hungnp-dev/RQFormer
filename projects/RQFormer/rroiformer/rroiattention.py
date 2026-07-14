@@ -54,6 +54,8 @@ class RRoIAttention(BaseModule):
             for layer in module:
                 if isinstance(layer, nn.Linear):
                     xavier_init(layer, distribution='uniform', bias=0.)
+        constant_init(self.geometry_embed[-1], val=0., bias=0.)
+        constant_init(self.orientation_bias[-1], val=0., bias=0.)
 
     def _box_geometry(self,
                       boxes: Tensor,

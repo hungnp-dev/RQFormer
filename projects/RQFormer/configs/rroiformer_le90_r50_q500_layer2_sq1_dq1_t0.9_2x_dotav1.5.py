@@ -115,6 +115,7 @@ model = dict(
                 num_cls_fcs=1,
                 num_reg_fcs=3,
                 dropout=0.1,
+                use_geometry_relation=True,
                 self_attn_cfg=dict(
                     embed_dims=256,
                     num_heads=8,
@@ -124,6 +125,7 @@ model = dict(
                     embed_dims=256,
                     num_heads=8,
                     roi_pooler_resolution=7,
+                    use_geometry=True,
                 ),
                 ffn_cfg=dict(
                     embed_dims=256,
