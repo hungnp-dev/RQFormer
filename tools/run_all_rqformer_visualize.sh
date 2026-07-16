@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # Compact single-GPU workflow for RQFormer-2.
@@ -13,7 +13,7 @@ CKPT_DIR="${CKPT_DIR:-$HOME/pth}"
 WORK_ROOT="${WORK_ROOT:-$REPO_DIR/work_dirs}"
 
 DEVICE="${CUDA_VISIBLE_DEVICES:-0}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 SAMPLE_IMAGES="${SAMPLE_IMAGES:-10}"
 SCORE_THR="${SCORE_THR:-0.3}"
@@ -74,31 +74,52 @@ setup_env() {
 }
 
 latest_ckpt() {
-  local dir="$1"
+  local dir="$1" ckpt_name="${2:-}"
   [[ -d "$dir" ]] || return 0
+  [[ -n "$ckpt_name" && -f "$dir/$ckpt_name" ]] && { echo "$dir/$ckpt_name"; return 0; }
   [[ -f "$dir/latest.pth" ]] && { echo "$dir/latest.pth"; return 0; }
   find "$dir" -maxdepth 1 -type f -name 'epoch_*.pth' 2>/dev/null | sort -V | tail -n 1 || true
 }
 
+keep_single_ckpt() {
+  local dir="$1" ckpt_name="$2" src final
+  final="$dir/$ckpt_name"
+  src="$(latest_ckpt "$dir" "$ckpt_name")"
+  [[ -n "$src" && -f "$src" ]] || { echo "[WARN NO TRAIN CKPT] $dir"; return 1; }
+
+  if [[ "$src" != "$final" ]]; then
+    cp -f "$src" "$final.tmp"
+    mv -f "$final.tmp" "$final"
+  fi
+  find "$dir" -maxdepth 1 \( -type f -o -type l \) -name "*.pth" ! -name "$ckpt_name" -delete
+  echo "[SINGLE CKPT] $final"
+}
 resolve_ckpt() {
-  local train_dir="$1" external="$2" trained
-  trained="$(latest_ckpt "$train_dir")"
+  local train_dir="$1" external="$2" ckpt_name trained
+  ckpt_name="$(basename "$external")"
+  trained="$(latest_ckpt "$train_dir" "$ckpt_name")"
   [[ -n "$trained" && -f "$trained" ]] && echo "$trained" || echo "$external"
 }
 
 run_train() {
-  local title="$1" config="$2" out_dir="$3" done="$4" ckpt
+  local title="$1" config="$2" out_dir="$3" done="$4" ckpt_name="$5" ckpt
   [[ "$RUN_TRAIN" == "1" ]] || { echo "[SKIP TRAIN] $title"; return 0; }
-  ckpt="$(latest_ckpt "$out_dir")"
-  [[ -f "$done" && "$FORCE" != "1" ]] && { echo "[SKIP TRAIN DONE] $title"; return 0; }
-  [[ -n "$ckpt" && -f "$ckpt" && "$FORCE" != "1" ]] && { echo "[SKIP TRAIN CKPT] $ckpt"; touch "$done"; return 0; }
+  ckpt="$(latest_ckpt "$out_dir" "$ckpt_name")"
+  [[ -f "$done" && "$FORCE" != "1" ]] && { echo "[SKIP TRAIN DONE] $title"; keep_single_ckpt "$out_dir" "$ckpt_name" || true; return 0; }
 
   mkdir -p "$out_dir"
   echo "[RUN TRAIN] $title"
-  python tools/train.py "$config" --work-dir "$out_dir"
+  if [[ -n "$ckpt" && -f "$ckpt" && "$FORCE" != "1" ]]; then
+    echo "[RESUME TRAIN] $ckpt"
+    python tools/train.py "$config" --work-dir "$out_dir" --resume \
+      --cfg-options train_dataloader.batch_size="$BATCH_SIZE" train_dataloader.num_workers="$NUM_WORKERS" default_hooks.checkpoint.max_keep_ckpts=1
+  else
+    python tools/train.py "$config" --work-dir "$out_dir" \
+      --cfg-options train_dataloader.batch_size="$BATCH_SIZE" train_dataloader.num_workers="$NUM_WORKERS" default_hooks.checkpoint.max_keep_ckpts=1
+  fi
+  keep_single_ckpt "$out_dir" "$ckpt_name"
   touch "$done"
 }
-
 run_test() {
   local title="$1" config="$2" ckpt="$3" out_dir="$4" done="$5" pred="$6"
   [[ "$RUN_TEST" == "1" ]] || { echo "[SKIP TEST] $title"; return 0; }
@@ -172,7 +193,7 @@ run_job() {
     echo "Output:  $root"
     echo "============================================================"
 
-    run_train "$title" "$config" "$train_dir" "$root/.train.done"
+    run_train "$title" "$config" "$train_dir" "$root/.train.done" "$(basename "$external_ckpt")"
     ckpt="$(resolve_ckpt "$train_dir" "$external_ckpt")"
     echo "[USING CKPT] $ckpt"
     run_test "$title" "$config" "$ckpt" "$test_dir" "$root/.test.done" "$pred"

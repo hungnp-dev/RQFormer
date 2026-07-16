@@ -67,15 +67,39 @@ def patch_rroi_attention(model):
 
         original_forward = module.forward
 
-        def forward_with_cache(query, roi_feat, _module=module):
+        def forward_with_cache(query,
+                               roi_feat,
+                               boxes=None,
+                               img_shape=None,
+                               _module=module,
+                               **kwargs):
+            """Mirror RRoIAttention.forward and cache attention weights.
+
+            RQFormer-2 passes rotated geometry via ``boxes`` and ``img_shape``.
+            The visualizer used to patch the old two-argument forward, which
+            broke when geometry-aware attention was enabled. Keep this wrapper
+            signature compatible with both the original and improved modules.
+            """
             bs, num_queries = query.shape[:2]
-            attn = _module.attention_weights(query).view(
+            geometry = None
+            if (getattr(_module, 'use_geometry', False) and boxes is not None
+                    and boxes.numel() > 0):
+                geometry = _module._box_geometry(boxes, img_shape)
+                query = query + _module.geometry_embed(geometry).unsqueeze(0)
+
+            attention_logits = _module.attention_weights(query).view(
                 bs, num_queries, _module.num_heads,
                 _module.roi_pooler_resolution**2)
-            attn = attn.softmax(-1)
-            _module.last_attention_weights = attn.detach().cpu()
+            if geometry is not None:
+                orientation_bias = _module.orientation_bias(geometry).view(
+                    1, num_queries, _module.num_heads,
+                    _module.roi_pooler_resolution**2)
+                attention_logits = attention_logits + orientation_bias
 
-            attn = attn.unsqueeze(-2)
+            attention_weights = attention_logits.softmax(-1)
+            _module.last_attention_weights = attention_weights.detach().cpu()
+
+            attn = attention_weights.unsqueeze(-2)
             value = _module.value_proj(
                 roi_feat.permute(0, 2, 3, 1)).permute(0, 3, 1,
                                                       2).contiguous()
