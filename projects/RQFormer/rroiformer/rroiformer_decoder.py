@@ -521,12 +521,39 @@ class RRoIFormerDecoder(CascadeRoIHead):
 
         topk_inds_list = []
         results_list = []
+        score_thr = float(rcnn_test_cfg.get('score_thr', 0.0)) if rcnn_test_cfg else 0.0
+        nms_cfg = rcnn_test_cfg.get('nms', None) if rcnn_test_cfg else None
+        nms_pre = int(rcnn_test_cfg.get('nms_pre', -1)) if rcnn_test_cfg else -1
+        max_per_img = int(rcnn_test_cfg.get('max_per_img', initial_num_query)) if rcnn_test_cfg else initial_num_query
         for img_id in range(len(batch_img_metas)):
             cls_score_per_img = cls_score_[img_id]
-            scores_per_img, topk_inds = cls_score_per_img.flatten(0, 1).topk(
-                batch_start_index[img_id+1]-batch_start_index[img_id], sorted=False)
+            flat_scores = cls_score_per_img.flatten(0, 1)
+            pre_topk = flat_scores.numel()
+            if nms_cfg is None:
+                pre_topk = min(max_per_img, pre_topk)
+            elif nms_pre > 0:
+                pre_topk = min(nms_pre, pre_topk)
+            scores_per_img, topk_inds = flat_scores.topk(pre_topk, sorted=True)
             labels_per_img = topk_inds % num_classes
             bboxes_per_img = proposal_list[img_id][topk_inds // num_classes]
+
+            if score_thr > 0:
+                valid = scores_per_img >= score_thr
+                scores_per_img = scores_per_img[valid]
+                labels_per_img = labels_per_img[valid]
+                bboxes_per_img = bboxes_per_img[valid]
+                topk_inds = topk_inds[valid]
+
+            if nms_cfg is not None and bboxes_per_img.size(0) > 0:
+                _, keep_idxs = batched_nms(
+                    bboxes_per_img, scores_per_img, labels_per_img, nms_cfg)
+                if max_per_img > 0:
+                    keep_idxs = keep_idxs[:max_per_img]
+                scores_per_img = scores_per_img[keep_idxs]
+                labels_per_img = labels_per_img[keep_idxs]
+                bboxes_per_img = bboxes_per_img[keep_idxs]
+                topk_inds = topk_inds[keep_idxs]
+
             topk_inds_list.append(topk_inds)
             if rescale and bboxes_per_img.size(0) > 0:
                 assert batch_img_metas[img_id].get('scale_factor') is not None

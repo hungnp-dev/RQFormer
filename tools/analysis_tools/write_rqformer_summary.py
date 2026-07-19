@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 import argparse
 import json
 import re
@@ -141,9 +141,10 @@ def main():
             batch_from_log_or_config(repo, work_dir, job['config']),
             meta['angle'],
             meta['query'],
+            meta['config'],
         ])
 
-    headers = ['Dataset', 'AP50', 'AP75', 'mAP', 'Backbone', 'lr schd', 'batch', 'Angle', 'Query']
+    headers = ['Dataset', 'AP50', 'AP75', 'mAP', 'Backbone', 'lr schd', 'batch', 'Angle', 'Query', 'Configs']
     lines = []
     lines.append('| ' + ' | '.join(headers) + ' |')
     lines.append('| ' + ' | '.join(['---'] * len(headers)) + ' |')
