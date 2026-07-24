@@ -21,6 +21,11 @@ def parse_args():
     parser.add_argument('config', help='train config file path')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument(
+        '--performance-profile',
+        choices=['default', 'max3090ti'],
+        default='default',
+        help='preset dataloader/training settings for the target hardware')
+    parser.add_argument(
         '--device',
         choices=['cuda', 'cpu', 'auto'],
         default='cuda',
@@ -161,6 +166,36 @@ def configure_best_checkpoint_saving(cfg):
     cfg.default_hooks.checkpoint.setdefault('max_keep_ckpts', 3)
 
 
+def configure_performance_profile(cfg, args):
+    """Apply hardware-oriented defaults while keeping CLI overrides possible."""
+    if args.performance_profile != 'max3090ti':
+        return
+
+    cfg.setdefault('train_dataloader', {})
+    cfg.train_dataloader['batch_size'] = 12
+    cfg.train_dataloader['num_workers'] = 8
+    cfg.train_dataloader['persistent_workers'] = True
+
+    cfg.setdefault('val_dataloader', {})
+    cfg.val_dataloader['batch_size'] = 4
+    cfg.val_dataloader['num_workers'] = 4
+    cfg.val_dataloader['persistent_workers'] = True
+
+    if 'test_dataloader' in cfg:
+        cfg.test_dataloader['batch_size'] = 4
+        cfg.test_dataloader['num_workers'] = 4
+        cfg.test_dataloader['persistent_workers'] = True
+
+    cfg.setdefault('train_cfg', {})
+    cfg.train_cfg.setdefault('max_epochs', 36)
+    cfg.train_cfg['val_interval'] = 3
+
+    cfg.setdefault('default_hooks', {})
+    cfg.default_hooks.setdefault('checkpoint', dict(type='CheckpointHook'))
+    cfg.default_hooks.checkpoint['interval'] = 3
+    cfg.default_hooks.checkpoint['max_keep_ckpts'] = 3
+
+
 def disable_backbone_pretrain_for_finetuning(cfg):
     """Avoid downloading torchvision weights when a full checkpoint is loaded."""
     if cfg.get('load_from', None) is None:
@@ -193,6 +228,17 @@ def log_finetuning_summary(cfg, args):
     print(f'Work dir: {cfg.work_dir}', flush=True)
     print(f'Load from: {cfg.get("load_from", None)}', flush=True)
     print(f'Device: {cfg.get("device", "unknown")}', flush=True)
+    print(f'Performance profile: {args.performance_profile}', flush=True)
+    print(
+        f'Train batch/workers: '
+        f'{cfg.train_dataloader.get("batch_size", "unknown")}/'
+        f'{cfg.train_dataloader.get("num_workers", "unknown")}',
+        flush=True)
+    print(
+        f'Val batch/workers: '
+        f'{cfg.val_dataloader.get("batch_size", "unknown")}/'
+        f'{cfg.val_dataloader.get("num_workers", "unknown")}',
+        flush=True)
     print(f'Train dataset: {summarize_train_dataset(cfg)}', flush=True)
     print(
         f'Freeze original: {args.freeze_original}, '
@@ -207,6 +253,18 @@ def log_finetuning_summary(cfg, args):
     print_log(f'Load from: {cfg.get("load_from", None)}', logger='current')
     print_log(f'Resume: {cfg.get("resume", False)}', logger='current')
     print_log(f'Device: {cfg.get("device", "unknown")}', logger='current')
+    print_log(f'Performance profile: {args.performance_profile}',
+              logger='current')
+    print_log(
+        f'Train batch/workers: '
+        f'{cfg.train_dataloader.get("batch_size", "unknown")}/'
+        f'{cfg.train_dataloader.get("num_workers", "unknown")}',
+        logger='current')
+    print_log(
+        f'Val batch/workers: '
+        f'{cfg.val_dataloader.get("batch_size", "unknown")}/'
+        f'{cfg.val_dataloader.get("num_workers", "unknown")}',
+        logger='current')
     print_log(f'Launcher: {cfg.launcher}', logger='current')
     print_log(f'Log interval: every {TERMINAL_LOG_INTERVAL} iteration',
               logger='current')
@@ -273,6 +331,7 @@ def main():
 
     configure_device_for_windows_gpu(cfg, args)
     configure_terminal_logging(cfg)
+    configure_performance_profile(cfg, args)
     configure_dataloader_for_windows(cfg)
     configure_best_checkpoint_saving(cfg)
     disable_backbone_pretrain_for_finetuning(cfg)
