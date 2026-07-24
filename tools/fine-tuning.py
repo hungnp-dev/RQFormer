@@ -3,6 +3,8 @@ import argparse
 import logging
 import os
 import os.path as osp
+import sys
+from datetime import datetime
 
 from mmdet.utils import register_all_modules as register_all_modules_mmdet
 from mmengine.config import Config, DictAction
@@ -14,6 +16,26 @@ from mmrotate.utils import register_all_modules
 
 
 TERMINAL_LOG_INTERVAL = 1
+
+
+class Tee:
+    """Write terminal output to both console and a text log file."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, 'isatty', lambda: False)()
+                   for stream in self.streams)
 
 
 def parse_args():
@@ -166,6 +188,28 @@ def configure_best_checkpoint_saving(cfg):
     cfg.default_hooks.checkpoint.setdefault('max_keep_ckpts', 3)
 
 
+def configure_text_log_capture(cfg):
+    """Mirror all terminal stdout/stderr into a .txt log in work_dir."""
+    os.makedirs(cfg.work_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_path = osp.join(cfg.work_dir, f'fine_tuning_terminal_{timestamp}.txt')
+    log_file = open(log_path, 'a', encoding='utf-8', buffering=1)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = Tee(original_stdout, log_file)
+    sys.stderr = Tee(original_stderr, log_file)
+    cfg.fine_tuning_terminal_log = log_path
+    print(f'Terminal log file: {log_path}', flush=True)
+    return log_file, original_stdout, original_stderr
+
+
+def close_text_log_capture(log_file, original_stdout, original_stderr):
+    """Restore terminal streams and close the mirrored text log."""
+    sys.stdout = original_stdout
+    sys.stderr = original_stderr
+    log_file.close()
+
+
 def configure_performance_profile(cfg, args):
     """Apply hardware-oriented defaults while keeping CLI overrides possible."""
     if args.performance_profile != 'max3090ti':
@@ -226,6 +270,8 @@ def log_finetuning_summary(cfg, args):
     print('\nCPSQ-RQFormer fine-tuning startup', flush=True)
     print(f'Config: {args.config}', flush=True)
     print(f'Work dir: {cfg.work_dir}', flush=True)
+    print(f'Terminal log file: {cfg.get("fine_tuning_terminal_log", None)}',
+          flush=True)
     print(f'Load from: {cfg.get("load_from", None)}', flush=True)
     print(f'Device: {cfg.get("device", "unknown")}', flush=True)
     print(f'Performance profile: {args.performance_profile}', flush=True)
@@ -250,6 +296,8 @@ def log_finetuning_summary(cfg, args):
     print_log('CPSQ-RQFormer fine-tuning startup', logger='current')
     print_log(f'Config: {args.config}', logger='current')
     print_log(f'Work dir: {cfg.work_dir}', logger='current')
+    print_log(f'Terminal log file: {cfg.get("fine_tuning_terminal_log", None)}',
+              logger='current')
     print_log(f'Load from: {cfg.get("load_from", None)}', logger='current')
     print_log(f'Resume: {cfg.get("resume", False)}', logger='current')
     print_log(f'Device: {cfg.get("device", "unknown")}', logger='current')
@@ -326,12 +374,11 @@ def main():
     cfg.launcher = args.launcher
     if args.load_from is not None:
         cfg.load_from = args.load_from
-    if args.cfg_options is not None:
-        cfg.merge_from_dict(args.cfg_options)
-
     configure_device_for_windows_gpu(cfg, args)
     configure_terminal_logging(cfg)
     configure_performance_profile(cfg, args)
+    if args.cfg_options is not None:
+        cfg.merge_from_dict(args.cfg_options)
     configure_dataloader_for_windows(cfg)
     configure_best_checkpoint_saving(cfg)
     disable_backbone_pretrain_for_finetuning(cfg)
@@ -341,58 +388,49 @@ def main():
     elif cfg.get('work_dir', None) is None:
         cfg.work_dir = osp.join('./work_dirs',
                                 osp.splitext(osp.basename(args.config))[0])
+    terminal_log_file, original_stdout, original_stderr = \
+        configure_text_log_capture(cfg)
 
-    if args.amp is True:
-        print_log(
-            'AMP is disabled for this RQFormer fine-tuning run because the '
-            'original QualityFocalLoss uses binary_cross_entropy on '
-            'probabilities, which is unsafe under autocast.',
-            logger='current',
-            level=logging.WARNING)
-        args.amp = False
-
-    if args.amp is True:
-        optim_wrapper = cfg.optim_wrapper.type
-        if optim_wrapper == 'AmpOptimWrapper':
+    try:
+        if args.amp is True:
             print_log(
-                'AMP training is already enabled in your config.',
+                'AMP is disabled for this RQFormer fine-tuning run because '
+                'the original QualityFocalLoss uses binary_cross_entropy on '
+                'probabilities, which is unsafe under autocast.',
                 logger='current',
                 level=logging.WARNING)
+
+        if args.auto_scale_lr:
+            if 'auto_scale_lr' in cfg and \
+                    'enable' in cfg.auto_scale_lr and \
+                    'base_batch_size' in cfg.auto_scale_lr:
+                cfg.auto_scale_lr.enable = True
+            else:
+                raise RuntimeError('Can not find "auto_scale_lr" or '
+                                   '"auto_scale_lr.enable" or '
+                                   '"auto_scale_lr.base_batch_size" in your'
+                                   ' configuration file.')
+
+        cfg.resume = args.resume
+        log_finetuning_summary(cfg, args)
+
+        if 'runner_type' not in cfg:
+            runner = Runner.from_cfg(cfg)
         else:
-            assert optim_wrapper == 'OptimWrapper', (
-                '`--amp` is only supported when the optimizer wrapper type is '
-                f'`OptimWrapper` but got {optim_wrapper}.')
-            cfg.optim_wrapper.type = 'AmpOptimWrapper'
-            cfg.optim_wrapper.loss_scale = 'dynamic'
+            runner = RUNNERS.build(cfg)
 
-    if args.auto_scale_lr:
-        if 'auto_scale_lr' in cfg and \
-                'enable' in cfg.auto_scale_lr and \
-                'base_batch_size' in cfg.auto_scale_lr:
-            cfg.auto_scale_lr.enable = True
-        else:
-            raise RuntimeError('Can not find "auto_scale_lr" or '
-                               '"auto_scale_lr.enable" or '
-                               '"auto_scale_lr.base_batch_size" in your'
-                               ' configuration file.')
+        if args.freeze_original:
+            freeze_original_parameters(
+                runner.model,
+                args.trainable_keywords,
+                allow_empty=args.allow_empty_trainable)
 
-    cfg.resume = args.resume
-    log_finetuning_summary(cfg, args)
-
-    if 'runner_type' not in cfg:
-        runner = Runner.from_cfg(cfg)
-    else:
-        runner = RUNNERS.build(cfg)
-
-    if args.freeze_original:
-        freeze_original_parameters(
-            runner.model,
-            args.trainable_keywords,
-            allow_empty=args.allow_empty_trainable)
-
-    print_log('Fine-tuning loop is starting now.', logger='current')
-    runner.train()
-    print_log('Fine-tuning finished.', logger='current')
+        print_log('Fine-tuning loop is starting now.', logger='current')
+        runner.train()
+        print_log('Fine-tuning finished.', logger='current')
+    finally:
+        close_text_log_capture(
+            terminal_log_file, original_stdout, original_stderr)
 
 
 if __name__ == '__main__':
