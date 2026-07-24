@@ -389,7 +389,7 @@ class OrientedDDQFCNRPN(AnchorFreeHead):
 
             binary_cls_score = cls_score.max(-1).values.reshape(-1, 1)
             if self.dqs_cfg:
-                nms_pre = self.dqs_cfg.pop('nms_pre', 1000)
+                nms_pre = self.dqs_cfg.get('nms_pre', 1000)
             else:
                 if self.training:
                     nms_pre = len(binary_cls_score)
@@ -418,16 +418,22 @@ class OrientedDDQFCNRPN(AnchorFreeHead):
         all_distinct_bboxes = []
         all_distinct_scores = []
         all_distinct_query_ids = []
+        nms_cfg = self.dqs_cfg.copy() if self.dqs_cfg is not None else None
+        if nms_cfg is not None:
+            nms_cfg.pop('nms_pre', None)
         for mlvl_bboxes, mlvl_scores, query_id in zip(all_mlvl_bboxes,
                                                       all_mlvl_scores,
                                                       all_query_ids):
             if mlvl_bboxes.numel() == 0:
-                return mlvl_bboxes, mlvl_scores, query_id
+                all_distinct_bboxes.append(mlvl_bboxes)
+                all_distinct_scores.append(mlvl_scores)
+                all_distinct_query_ids.append(query_id)
+                continue
 
             det_bboxes, keep_idxs = batched_nms(mlvl_bboxes,
                                                 mlvl_scores.max(-1).values,
                                                 torch.ones(len(mlvl_scores)),
-                                                self.dqs_cfg)
+                                                nms_cfg)
 
             all_distinct_bboxes.append(mlvl_bboxes[keep_idxs])
             all_distinct_scores.append(mlvl_scores[keep_idxs])

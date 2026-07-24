@@ -41,6 +41,7 @@ class RRoIFormerDecoder(CascadeRoIHead):
                  stage_loss_weights: Tuple[float] = (1, 1, 1, 1, 1, 1),
                  selective_query=[0],
                  distinct_query=0,
+                 cpsq_cfg: OptConfigType = None,
                  bbox_roi_extractor: ConfigType = dict(
                      type='RotatedSingleRoIExtractor',
                      roi_layer=dict(
@@ -115,6 +116,7 @@ class RRoIFormerDecoder(CascadeRoIHead):
             train_cfg=train_cfg,
             test_cfg=test_cfg,
             init_cfg=init_cfg)
+        self.cpsq = MODELS.build(cpsq_cfg) if cpsq_cfg is not None else None
         # train_cfg would be None when run the test.py
         if train_cfg is not None:
             for stage in range(num_stages):
@@ -255,8 +257,7 @@ class RRoIFormerDecoder(CascadeRoIHead):
         bbox_feats = bbox_roi_extractor(x[:bbox_roi_extractor.num_inputs],
                                         rois)   # N1+N2, 256, 7, 7
         cls_score, bbox_pred, query, attn_feats = bbox_head(
-            bbox_feats, query, query_pos, batch_start_index, rois=rois,
-            batch_img_metas=batch_img_metas)   # [N1+N2, 15], [N1+N2, 5], [N1+N2, 256], [N1+N2, 256]
+            bbox_feats, query, query_pos, batch_start_index)   # [N1+N2, 15], [N1+N2, 5], [N1+N2, 256], [N1+N2, 256]
 
         fake_bbox_results = dict(
             rois=rois,
@@ -291,6 +292,81 @@ class RRoIFormerDecoder(CascadeRoIHead):
             detached_proposals=[item.detach() for item in proposal_list])
 
         return bbox_results
+
+    def _select_queries_with_cpsq(self,
+                                  batch_img_metas: List[dict],
+                                  batch_start_index: Tensor,
+                                  query_for_last_layer: List[Tensor],
+                                  cls_score_for_last_layer: List[Tensor],
+                                  proposal_for_last_layer: List[Tensor],
+                                  query_pos_for_last_layer: List[Tensor],
+                                  initial_num_query: int,
+                                  gt_instances: InstanceList = None
+                                  ) -> Tuple[Tensor, Tensor, List[Tensor],
+                                             Tensor, Tensor, Tensor, dict]:
+        """Select representative intermediate queries with CPSQ per image."""
+        topk_query, topk_proposal, topk_pos, topk_score = [], [], [], []
+        num_selected_per_img = []
+        cpsq_losses = dict()
+
+        for img_id in range(len(batch_img_metas)):
+            per_img_query = torch.cat([
+                q[batch_start_index[img_id]:batch_start_index[img_id + 1]]
+                for q in query_for_last_layer
+            ], dim=0)
+            per_img_proposal = torch.cat([
+                p[batch_start_index[img_id]:batch_start_index[img_id + 1]]
+                for p in proposal_for_last_layer
+            ], dim=0)
+            per_img_scores = torch.cat([
+                s[batch_start_index[img_id]:batch_start_index[img_id + 1]]
+                for s in cls_score_for_last_layer
+            ], dim=0)
+            per_img_pos = torch.cat([
+                p[batch_start_index[img_id]:batch_start_index[img_id + 1]]
+                for p in query_pos_for_last_layer
+            ], dim=0)
+
+            gt_bboxes, gt_labels = None, None
+            if gt_instances is not None:
+                gt_bboxes = gt_instances[img_id].bboxes
+                gt_labels = gt_instances[img_id].labels
+
+            keep_idxs, per_img_losses = self.cpsq.select(
+                query=per_img_query,
+                cls_score=per_img_scores,
+                bboxes=per_img_proposal,
+                gt_bboxes=gt_bboxes,
+                gt_labels=gt_labels,
+                max_select=initial_num_query)
+
+            topk_query.append(per_img_query[keep_idxs])
+            topk_proposal.append(per_img_proposal[keep_idxs])
+            topk_pos.append(per_img_pos[keep_idxs])
+            topk_score.append(per_img_scores[keep_idxs])
+            num_selected_per_img.append(len(keep_idxs))
+            for name, value in per_img_losses.items():
+                cpsq_losses[name] = (
+                    cpsq_losses.get(name, value.new_zeros(())) + value)
+
+        if cpsq_losses:
+            num_imgs = len(batch_img_metas)
+            cpsq_losses = {
+                name: value / num_imgs
+                for name, value in cpsq_losses.items()
+            }
+
+        num_selected_per_img = torch.tensor(
+            num_selected_per_img, device=topk_query[0].device)
+        batch_start_index = torch.cat([
+            batch_start_index.new_zeros((1,)),
+            torch.cumsum(num_selected_per_img, dim=0)
+        ])
+        query = torch.cat(topk_query, dim=0)
+        query_pos = torch.cat(topk_pos, dim=0)
+        cls_score = torch.cat(topk_score, dim=0)
+        return (query, query_pos, topk_proposal, cls_score,
+                num_selected_per_img, batch_start_index, cpsq_losses)
 
     def loss(self, x: Tuple[Tensor], rpn_results_list: InstanceList,
              batch_data_samples: SampleList) -> dict:
@@ -357,39 +433,53 @@ class RRoIFormerDecoder(CascadeRoIHead):
             # filter similar query and proposal by NMS and top-k to obtain distinct query.
             assert self.distinct_query < self.num_stages - 1 and self.distinct_query >= max(self.selective_query)
             if stage == self.distinct_query:
-                topk_query, topk_proposal, topk_pos,new_batch_start_index = [], [], [], []
-                distinct_cfg = self.distinct_cfg
-                for img_id in range(len(batch_img_metas)):
-                    per_img_query = torch.cat([q[batch_start_index[img_id]:batch_start_index[img_id+1]]
-                                               for q in query_for_last_layer], dim=0)       # 1*N1, 256
-                    per_img_proposal = torch.cat([p[batch_start_index[img_id]:batch_start_index[img_id+1]]
-                                                  for p in proposal_for_last_layer], dim=0) # 1*N1, 5
-                    per_img_scores = torch.cat([s[batch_start_index[img_id]:batch_start_index[img_id+1]]
-                                                for s in cls_score_for_last_layer], dim=0)  # 1*N1, 15
-                    per_img_pos = torch.cat([p[batch_start_index[img_id]:batch_start_index[img_id+1]]
-                                             for p in query_pos_for_last_layer], dim=0)  # 1*N, 256
-                    _, keep_idxs = batched_nms(per_img_proposal,
-                                               per_img_scores.max(-1).values,
-                                               torch.ones(len(per_img_scores)), distinct_cfg)
+                if self.cpsq is not None:
+                    query, query_pos, topk_proposal, _, new_batch_start_index, \
+                        batch_start_index, cpsq_losses = self._select_queries_with_cpsq(
+                            batch_img_metas=batch_img_metas,
+                            batch_start_index=batch_start_index,
+                            query_for_last_layer=query_for_last_layer,
+                            cls_score_for_last_layer=cls_score_for_last_layer,
+                            proposal_for_last_layer=proposal_for_last_layer,
+                            query_pos_for_last_layer=query_pos_for_last_layer,
+                            initial_num_query=initial_num_query,
+                            gt_instances=batch_gt_instances)
+                    losses.update(cpsq_losses)
+                else:
+                    topk_query, topk_proposal, topk_pos,new_batch_start_index = [], [], [], []
+                    distinct_cfg = self.distinct_cfg
+                    for img_id in range(len(batch_img_metas)):
+                        per_img_query = torch.cat([q[batch_start_index[img_id]:batch_start_index[img_id+1]]
+                                                   for q in query_for_last_layer], dim=0)       # 1*N1, 256
+                        per_img_proposal = torch.cat([p[batch_start_index[img_id]:batch_start_index[img_id+1]]
+                                                      for p in proposal_for_last_layer], dim=0) # 1*N1, 5
+                        per_img_scores = torch.cat([s[batch_start_index[img_id]:batch_start_index[img_id+1]]
+                                                    for s in cls_score_for_last_layer], dim=0)  # 1*N1, 15
+                        per_img_pos = torch.cat([p[batch_start_index[img_id]:batch_start_index[img_id+1]]
+                                                 for p in query_pos_for_last_layer], dim=0)  # 1*N, 256
+                        _, keep_idxs = batched_nms(per_img_proposal,
+                                                   per_img_scores.max(-1).values,
+                                                   torch.ones(len(per_img_scores)), distinct_cfg)
 
-                    if len(keep_idxs) >= initial_num_query:
-                        topk_query.append(per_img_query[keep_idxs][:initial_num_query])       # N1, 256
-                        topk_proposal.append(per_img_proposal[keep_idxs][:initial_num_query]) # N1, 4
-                        topk_pos.append(per_img_pos[keep_idxs][:initial_num_query])           # N1, 256
-                        new_batch_start_index.append(initial_num_query) # due to [:initial_num_query]
-                    else:
-                        topk_query.append(per_img_query[keep_idxs])       # N1', 256
-                        topk_proposal.append(per_img_proposal[keep_idxs]) # N1', 4
-                        topk_pos.append(per_img_pos[keep_idxs])           # N1', 256
-                        new_batch_start_index.append(len(keep_idxs))
+                        if len(keep_idxs) >= initial_num_query:
+                            topk_query.append(per_img_query[keep_idxs][:initial_num_query])       # N1, 256
+                            topk_proposal.append(per_img_proposal[keep_idxs][:initial_num_query]) # N1, 4
+                            topk_pos.append(per_img_pos[keep_idxs][:initial_num_query])           # N1, 256
+                            new_batch_start_index.append(initial_num_query) # due to [:initial_num_query]
+                        else:
+                            topk_query.append(per_img_query[keep_idxs])       # N1', 256
+                            topk_proposal.append(per_img_proposal[keep_idxs]) # N1', 4
+                            topk_pos.append(per_img_pos[keep_idxs])           # N1', 256
+                            new_batch_start_index.append(len(keep_idxs))
 
-                # update query, query_pos, batch_start_index, results_list
-                query = torch.cat(topk_query, dim=0)    # N1'+N2', 256
-                query_pos = torch.cat(topk_pos, dim=0)  # N1'+N2', 256
-                new_batch_start_index = torch.tensor(new_batch_start_index,
-                                                     device=query.device)   # N1', N2'
-                batch_start_index = torch.cat([batch_start_index.new_zeros((1,)),
-                                               torch.cumsum(new_batch_start_index, dim=0)])  # [0, 0+N1', 0+N1'+N2', ...]
+                    # update query, query_pos, batch_start_index, results_list
+                    query = torch.cat(topk_query, dim=0)    # N1'+N2', 256
+                    query_pos = torch.cat(topk_pos, dim=0)  # N1'+N2', 256
+                    new_batch_start_index = torch.tensor(new_batch_start_index,
+                                                         device=query.device)   # N1', N2'
+                    batch_start_index = torch.cat([batch_start_index.new_zeros((1,)),
+                                                   torch.cumsum(new_batch_start_index, dim=0)])  # [0, 0+N1', 0+N1'+N2', ...]
+
                 results_list = []
                 for idx in range(len(batch_data_samples)):
                     results = InstanceData()
@@ -464,43 +554,55 @@ class RRoIFormerDecoder(CascadeRoIHead):
             # filter similar query and proposal by NMS and top-k to obtain distinct query.
             assert self.distinct_query < self.num_stages - 1 and self.distinct_query >= max(self.selective_query)
             if stage == self.distinct_query:
-                topk_query, topk_proposal, topk_pos, topk_score, \
-                new_batch_start_index = [], [], [], [], []
-                distinct_cfg = self.distinct_cfg
-                for img_id in range(len(batch_img_metas)):
-                    per_img_query = torch.cat([q[batch_start_index[img_id]:batch_start_index[img_id + 1]]
-                                               for q in query_for_last_layer], dim=0)  # 3*N1, 256
-                    per_img_proposal = torch.cat([p[batch_start_index[img_id]:batch_start_index[img_id + 1]]
-                                                  for p in proposal_for_last_layer], dim=0)  # 3*N1, 5
-                    per_img_scores = torch.cat([s[batch_start_index[img_id]:batch_start_index[img_id + 1]]
-                                                for s in cls_score_for_last_layer], dim=0)  # 3*N1, 80
-                    per_img_pos = torch.cat([p[batch_start_index[img_id]:batch_start_index[img_id + 1]]
-                                             for p in query_pos_for_last_layer], dim=0)  # 3*N, 256
-                    _, keep_idxs = batched_nms(per_img_proposal,
-                                               per_img_scores.max(-1).values,
-                                               torch.ones(len(per_img_scores)), distinct_cfg)
-                    if len(keep_idxs) >= initial_num_query:
-                        topk_query.append(per_img_query[keep_idxs][:initial_num_query])  # N1, 256
-                        topk_proposal.append(per_img_proposal[keep_idxs][:initial_num_query])  # N1, 5
-                        topk_pos.append(per_img_pos[keep_idxs][:initial_num_query])  # N1, 256
-                        topk_score.append(per_img_scores[keep_idxs][:initial_num_query]) # N1, 80
-                        new_batch_start_index.append(initial_num_query)  # due to [:initial_num_query]
-                    else:
-                        topk_query.append(per_img_query[keep_idxs])  # N1', 256
-                        topk_proposal.append(per_img_proposal[keep_idxs])  # N1', 5
-                        topk_pos.append(per_img_pos[keep_idxs])  # N1', 256
-                        topk_score.append(per_img_scores[keep_idxs]) # N1', 80
-                        new_batch_start_index.append(len(keep_idxs))
+                if self.cpsq is not None:
+                    query, query_pos, topk_proposal, cls_score, _, \
+                        batch_start_index, _ = self._select_queries_with_cpsq(
+                            batch_img_metas=batch_img_metas,
+                            batch_start_index=batch_start_index,
+                            query_for_last_layer=query_for_last_layer,
+                            cls_score_for_last_layer=cls_score_for_last_layer,
+                            proposal_for_last_layer=proposal_for_last_layer,
+                            query_pos_for_last_layer=query_pos_for_last_layer,
+                            initial_num_query=initial_num_query)
+                    proposal_list = topk_proposal
+                else:
+                    topk_query, topk_proposal, topk_pos, topk_score, \
+                    new_batch_start_index = [], [], [], [], []
+                    distinct_cfg = self.distinct_cfg
+                    for img_id in range(len(batch_img_metas)):
+                        per_img_query = torch.cat([q[batch_start_index[img_id]:batch_start_index[img_id + 1]]
+                                                   for q in query_for_last_layer], dim=0)  # 3*N1, 256
+                        per_img_proposal = torch.cat([p[batch_start_index[img_id]:batch_start_index[img_id + 1]]
+                                                      for p in proposal_for_last_layer], dim=0)  # 3*N1, 5
+                        per_img_scores = torch.cat([s[batch_start_index[img_id]:batch_start_index[img_id + 1]]
+                                                    for s in cls_score_for_last_layer], dim=0)  # 3*N1, 80
+                        per_img_pos = torch.cat([p[batch_start_index[img_id]:batch_start_index[img_id + 1]]
+                                                 for p in query_pos_for_last_layer], dim=0)  # 3*N, 256
+                        _, keep_idxs = batched_nms(per_img_proposal,
+                                                   per_img_scores.max(-1).values,
+                                                   torch.ones(len(per_img_scores)), distinct_cfg)
+                        if len(keep_idxs) >= initial_num_query:
+                            topk_query.append(per_img_query[keep_idxs][:initial_num_query])  # N1, 256
+                            topk_proposal.append(per_img_proposal[keep_idxs][:initial_num_query])  # N1, 5
+                            topk_pos.append(per_img_pos[keep_idxs][:initial_num_query])  # N1, 256
+                            topk_score.append(per_img_scores[keep_idxs][:initial_num_query]) # N1, 80
+                            new_batch_start_index.append(initial_num_query)  # due to [:initial_num_query]
+                        else:
+                            topk_query.append(per_img_query[keep_idxs])  # N1', 256
+                            topk_proposal.append(per_img_proposal[keep_idxs])  # N1', 5
+                            topk_pos.append(per_img_pos[keep_idxs])  # N1', 256
+                            topk_score.append(per_img_scores[keep_idxs]) # N1', 80
+                            new_batch_start_index.append(len(keep_idxs))
 
-                # update query, query_pos, batch_start_index, proposal_list
-                query = torch.cat(topk_query, dim=0)    # N1'+N2', 256
-                query_pos = torch.cat(topk_pos, dim=0)  # N1'+N2', 256
-                cls_score = torch.cat(topk_score, dim=0) # N1'+N2', 80
-                new_batch_start_index = torch.tensor(new_batch_start_index,
-                                                     device=query.device)   # N1', N2'
-                batch_start_index = torch.cat([batch_start_index.new_zeros((1,)),
-                                               torch.cumsum(new_batch_start_index, dim=0)])  # [0, 0+N1', 0+N1'+N2', ...]
-                proposal_list = topk_proposal   # {[N1, 5], [N2, 5]}
+                    # update query, query_pos, batch_start_index, proposal_list
+                    query = torch.cat(topk_query, dim=0)    # N1'+N2', 256
+                    query_pos = torch.cat(topk_pos, dim=0)  # N1'+N2', 256
+                    cls_score = torch.cat(topk_score, dim=0) # N1'+N2', 80
+                    new_batch_start_index = torch.tensor(new_batch_start_index,
+                                                         device=query.device)   # N1', N2'
+                    batch_start_index = torch.cat([batch_start_index.new_zeros((1,)),
+                                                   torch.cumsum(new_batch_start_index, dim=0)])  # [0, 0+N1', 0+N1'+N2', ...]
+                    proposal_list = topk_proposal   # {[N1, 5], [N2, 5]}
 
             else:
                 # update query, proposal_list
@@ -521,39 +623,12 @@ class RRoIFormerDecoder(CascadeRoIHead):
 
         topk_inds_list = []
         results_list = []
-        score_thr = float(rcnn_test_cfg.get('score_thr', 0.0)) if rcnn_test_cfg else 0.0
-        nms_cfg = rcnn_test_cfg.get('nms', None) if rcnn_test_cfg else None
-        nms_pre = int(rcnn_test_cfg.get('nms_pre', -1)) if rcnn_test_cfg else -1
-        max_per_img = int(rcnn_test_cfg.get('max_per_img', initial_num_query)) if rcnn_test_cfg else initial_num_query
         for img_id in range(len(batch_img_metas)):
             cls_score_per_img = cls_score_[img_id]
-            flat_scores = cls_score_per_img.flatten(0, 1)
-            pre_topk = flat_scores.numel()
-            if nms_cfg is None:
-                pre_topk = min(max_per_img, pre_topk)
-            elif nms_pre > 0:
-                pre_topk = min(nms_pre, pre_topk)
-            scores_per_img, topk_inds = flat_scores.topk(pre_topk, sorted=True)
+            scores_per_img, topk_inds = cls_score_per_img.flatten(0, 1).topk(
+                batch_start_index[img_id+1]-batch_start_index[img_id], sorted=False)
             labels_per_img = topk_inds % num_classes
             bboxes_per_img = proposal_list[img_id][topk_inds // num_classes]
-
-            if score_thr > 0:
-                valid = scores_per_img >= score_thr
-                scores_per_img = scores_per_img[valid]
-                labels_per_img = labels_per_img[valid]
-                bboxes_per_img = bboxes_per_img[valid]
-                topk_inds = topk_inds[valid]
-
-            if nms_cfg is not None and bboxes_per_img.size(0) > 0:
-                _, keep_idxs = batched_nms(
-                    bboxes_per_img, scores_per_img, labels_per_img, nms_cfg)
-                if max_per_img > 0:
-                    keep_idxs = keep_idxs[:max_per_img]
-                scores_per_img = scores_per_img[keep_idxs]
-                labels_per_img = labels_per_img[keep_idxs]
-                bboxes_per_img = bboxes_per_img[keep_idxs]
-                topk_inds = topk_inds[keep_idxs]
-
             topk_inds_list.append(topk_inds)
             if rescale and bboxes_per_img.size(0) > 0:
                 assert batch_img_metas[img_id].get('scale_factor') is not None
@@ -636,40 +711,53 @@ class RRoIFormerDecoder(CascadeRoIHead):
                 # prepare query and proposal as selective queries. stage: 0, 1
                 assert self.distinct_query < self.num_stages - 1 and self.distinct_query >= max(self.selective_query)
                 if stage == self.distinct_query:
-                    topk_query, topk_proposal, topk_pos, new_batch_start_index = [], [], [], []
-                    distinct_cfg = self.distinct_cfg
-                    for img_id in range(len(batch_img_metas)):
-                        per_img_query = torch.cat([q[batch_start_index[img_id]:batch_start_index[img_id + 1]]
-                                                   for q in query_for_last_layer], dim=0)  # 1*N1, 256
-                        per_img_proposal = torch.cat([p[batch_start_index[img_id]:batch_start_index[img_id + 1]]
-                                                      for p in proposal_for_last_layer], dim=0)  # 1*N1, 5
-                        per_img_scores = torch.cat([s[batch_start_index[img_id]:batch_start_index[img_id + 1]]
-                                                    for s in cls_score_for_last_layer], dim=0)  # 1*N1, 15
-                        per_img_pos = torch.cat([p[batch_start_index[img_id]:batch_start_index[img_id + 1]]
-                                                 for p in query_pos_for_last_layer], dim=0)  # 1*N, 256
-                        _, keep_idxs = batched_nms(per_img_proposal,
-                                                   per_img_scores.max(-1).values,
-                                                   torch.ones(len(per_img_scores)), distinct_cfg)
+                    if self.cpsq is not None:
+                        query, query_pos, topk_proposal, _, new_batch_start_index, \
+                            batch_start_index, _ = self._select_queries_with_cpsq(
+                                batch_img_metas=batch_img_metas,
+                                batch_start_index=batch_start_index,
+                                query_for_last_layer=query_for_last_layer,
+                                cls_score_for_last_layer=cls_score_for_last_layer,
+                                proposal_for_last_layer=proposal_for_last_layer,
+                                query_pos_for_last_layer=query_pos_for_last_layer,
+                                initial_num_query=initial_num_query,
+                                gt_instances=batch_gt_instances)
+                    else:
+                        topk_query, topk_proposal, topk_pos, new_batch_start_index = [], [], [], []
+                        distinct_cfg = self.distinct_cfg
+                        for img_id in range(len(batch_img_metas)):
+                            per_img_query = torch.cat([q[batch_start_index[img_id]:batch_start_index[img_id + 1]]
+                                                       for q in query_for_last_layer], dim=0)  # 1*N1, 256
+                            per_img_proposal = torch.cat([p[batch_start_index[img_id]:batch_start_index[img_id + 1]]
+                                                          for p in proposal_for_last_layer], dim=0)  # 1*N1, 5
+                            per_img_scores = torch.cat([s[batch_start_index[img_id]:batch_start_index[img_id + 1]]
+                                                        for s in cls_score_for_last_layer], dim=0)  # 1*N1, 15
+                            per_img_pos = torch.cat([p[batch_start_index[img_id]:batch_start_index[img_id + 1]]
+                                                     for p in query_pos_for_last_layer], dim=0)  # 1*N, 256
+                            _, keep_idxs = batched_nms(per_img_proposal,
+                                                       per_img_scores.max(-1).values,
+                                                       torch.ones(len(per_img_scores)), distinct_cfg)
 
-                        if len(keep_idxs) >= initial_num_query:
-                            topk_query.append(per_img_query[keep_idxs][:initial_num_query])  # N1, 256
-                            topk_proposal.append(per_img_proposal[keep_idxs][:initial_num_query])  # N1, 4
-                            topk_pos.append(per_img_pos[keep_idxs][:initial_num_query])  # N1, 256
-                            new_batch_start_index.append(initial_num_query)  # due to [:initial_num_query]
-                        else:
-                            topk_query.append(per_img_query[keep_idxs])  # N1', 256
-                            topk_proposal.append(per_img_proposal[keep_idxs])  # N1', 4
-                            topk_pos.append(per_img_pos[keep_idxs])  # N1', 256
-                            new_batch_start_index.append(len(keep_idxs))
+                            if len(keep_idxs) >= initial_num_query:
+                                topk_query.append(per_img_query[keep_idxs][:initial_num_query])  # N1, 256
+                                topk_proposal.append(per_img_proposal[keep_idxs][:initial_num_query])  # N1, 4
+                                topk_pos.append(per_img_pos[keep_idxs][:initial_num_query])  # N1, 256
+                                new_batch_start_index.append(initial_num_query)  # due to [:initial_num_query]
+                            else:
+                                topk_query.append(per_img_query[keep_idxs])  # N1', 256
+                                topk_proposal.append(per_img_proposal[keep_idxs])  # N1', 4
+                                topk_pos.append(per_img_pos[keep_idxs])  # N1', 256
+                                new_batch_start_index.append(len(keep_idxs))
 
-                    # update query, query_pos, batch_start_index, results_list
-                    query = torch.cat(topk_query, dim=0)  # N1'+N2', 256
-                    query_pos = torch.cat(topk_pos, dim=0)  # N1'+N2', 256
-                    new_batch_start_index = torch.tensor(new_batch_start_index,
-                                                         device=query.device)  # N1', N2'
-                    batch_start_index = torch.cat([batch_start_index.new_zeros((1,)),
-                                                   torch.cumsum(new_batch_start_index,
-                                                                dim=0)])  # [0, 0+N1', 0+N1'+N2', ...]
+                        # update query, query_pos, batch_start_index, results_list
+                        query = torch.cat(topk_query, dim=0)  # N1'+N2', 256
+                        query_pos = torch.cat(topk_pos, dim=0)  # N1'+N2', 256
+                        new_batch_start_index = torch.tensor(new_batch_start_index,
+                                                             device=query.device)  # N1', N2'
+                        batch_start_index = torch.cat([batch_start_index.new_zeros((1,)),
+                                                       torch.cumsum(new_batch_start_index,
+                                                                    dim=0)])  # [0, 0+N1', 0+N1'+N2', ...]
+
                     results_list = []
                     for idx in range(len(batch_img_metas)):
                         results = InstanceData()
@@ -692,4 +780,3 @@ class RRoIFormerDecoder(CascadeRoIHead):
                 all_stage_bbox_results.append((bbox_res,))
 
         return tuple(all_stage_bbox_results)
-

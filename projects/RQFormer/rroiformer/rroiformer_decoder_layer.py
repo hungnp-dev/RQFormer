@@ -15,7 +15,6 @@ from mmdet.utils import OptConfigType, reduce_mean, ConfigType
 from mmdet.models.roi_heads.bbox_heads import BBoxHead
 from typing import List, Tuple
 from .match_cost import normalize_angle
-from mmrotate.structures.bbox import rbbox_overlaps
 
 @MODELS.register_module()
 class RRoIFormerDecoderLayer(BBoxHead):
@@ -62,7 +61,6 @@ class RRoIFormerDecoderLayer(BBoxHead):
                      act_cfg=dict(type='ReLU', inplace=True)),
                  loss_iou: ConfigType = dict(type='GIoULoss', loss_weight=2.0),
                  init_cfg: OptConfigType = None,
-                 use_geometry_relation: bool = True,
                  **kwargs) -> None:
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                                  'behavior, init_cfg is not allowed to be set'
@@ -78,13 +76,6 @@ class RRoIFormerDecoderLayer(BBoxHead):
         self.fp16_enabled = False
         self.self_attn = MultiheadAttention(**self_attn_cfg)
         self.self_attn_norm = build_norm_layer(dict(type='LN'), self.embed_dims)[1]
-        self.use_geometry_relation = use_geometry_relation
-        self.geometry_relation = nn.Sequential(
-            nn.Linear(7, self.embed_dims),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.embed_dims, 1))
-        self.geometry_relation_dropout = nn.Dropout(dropout)
-        self.geometry_relation_scale = nn.Parameter(torch.zeros(1))
 
         self.rroi_attn = MODELS.build(rroi_attn_cfg)
         self.rroi_attn_dropout = nn.Dropout(dropout)
@@ -125,34 +116,6 @@ class RRoIFormerDecoderLayer(BBoxHead):
         assert self.reg_decoded_bbox, 'RRoIFormerDecoder only ' \
             'suppport `reg_decoded_bbox=True`'
 
-
-    def _relation_geometry(self, boxes: Tensor) -> Tensor:
-        """Build pairwise rotated geometric relation features."""
-        eps = boxes.new_tensor(1e-6)
-        cx, cy, w, h, theta = boxes.unbind(dim=-1)
-        w = w.clamp_min(eps)
-        h = h.clamp_min(eps)
-
-        dx = (cx[:, None] - cx[None, :]) / torch.sqrt(w[:, None] * h[:, None] + eps)
-        dy = (cy[:, None] - cy[None, :]) / torch.sqrt(w[:, None] * h[:, None] + eps)
-        dw = torch.log(w[:, None] / w[None, :] + eps)
-        dh = torch.log(h[:, None] / h[None, :] + eps)
-        dtheta = theta[:, None] - theta[None, :]
-        iou = rbbox_overlaps(boxes, boxes).to(boxes.dtype)
-        return torch.stack((dx, dy, dw, dh, torch.sin(dtheta),
-                            torch.cos(dtheta), iou), dim=-1)
-
-    def _apply_geometric_relation(self, query: Tensor, boxes: Tensor) -> Tensor:
-        """Refine query with learned pairwise rotated geometry relation."""
-        if (not self.use_geometry_relation or boxes is None or boxes.numel() == 0
-                or boxes.size(0) <= 1):
-            return query
-        relation_feat = self._relation_geometry(boxes)
-        relation_bias = self.geometry_relation(relation_feat).squeeze(-1)
-        relation_weight = relation_bias.softmax(dim=-1)
-        relation_context = torch.matmul(relation_weight, query)
-        return query + self.geometry_relation_scale * self.geometry_relation_dropout(relation_context)
-
     def init_weights(self) -> None:
         """Use xavier initialization for all weight parameter and set
         classification head bias as a specific value when use focal loss."""
@@ -169,8 +132,7 @@ class RRoIFormerDecoderLayer(BBoxHead):
             nn.init.constant_(self.fc_cls.bias, bias_init)
 
     def forward(self, roi_feat: Tensor, query: Tensor, query_pos: Tensor,
-                batch_start_index: Tensor, rois: Tensor = None,
-                batch_img_metas: List[dict] = None) -> tuple:
+                batch_start_index: Tensor) -> tuple:
         """Forward function of RRoIFormer Decoder Layer.
 
         Args:
@@ -203,15 +165,8 @@ class RRoIFormerDecoderLayer(BBoxHead):
 
         query_output, self_attn_feats_output = [], []
         for i in range(len(batch_start_index)-1):
-            start, end = batch_start_index[i], batch_start_index[i + 1]
-            query_ = query[start:end]
-            roi_feat_ = roi_feat[start:end]
-            boxes_ = rois[start:end, 1:] if rois is not None else None
-            img_shape = None
-            if batch_img_metas is not None:
-                img_shape = batch_img_metas[i].get('img_shape', None)
-
-            query_ = self._apply_geometric_relation(query_, boxes_)
+            query_ = query[batch_start_index[i]: batch_start_index[i + 1]]
+            roi_feat_ = roi_feat[batch_start_index[i]: batch_start_index[i + 1]]
 
             # Self attention
             query_ = query_.unsqueeze(1)    # N, 1, 256
@@ -220,7 +175,7 @@ class RRoIFormerDecoderLayer(BBoxHead):
 
             # rroi attention
             query_ = self_attn_feats    # 1, N, 256
-            rroi_attn = self.rroi_attn(query_, roi_feat_, boxes=boxes_, img_shape=img_shape)   # 1, N, 256
+            rroi_attn = self.rroi_attn(query_, roi_feat_)   # 1, N, 256
             query_ = self.rroi_attn_norm(query_ + self.rroi_attn_dropout(rroi_attn))  # 1, N, 256
 
             # FFN
@@ -465,5 +420,3 @@ class RRoIFormerDecoderLayer(BBoxHead):
             bbox_targets = torch.cat(bbox_targets, 0)
             bbox_weights = torch.cat(bbox_weights, 0)
         return labels, label_weights, bbox_targets, bbox_weights
-
-

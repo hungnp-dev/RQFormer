@@ -54,6 +54,17 @@ class TopkHungarianAssigner(TaskAlignedAssigner):
         all_cost = cls_cost + reg_cost + iou_cost
 
         num_gt, num_bboxes = gt_bboxes.size(0), pred_scores.size(0)
+        if num_bboxes == 0:
+            assigned_gt_inds = pred_scores.new_empty((0,), dtype=torch.long)
+            assigned_labels = pred_scores.new_empty((0,), dtype=torch.long)
+            assign_result = AssignResult(
+                num_gt,
+                assigned_gt_inds,
+                pred_scores.new_empty((0,)),
+                labels=assigned_labels)
+            assign_result.assign_metrics = pred_scores.new_empty((0,))
+            return assign_result
+
         if num_gt > 0:
             # assign 0 by default
             assigned_gt_inds = pred_scores.new_full((num_bboxes, ),
@@ -62,6 +73,15 @@ class TopkHungarianAssigner(TaskAlignedAssigner):
             select_cost = all_cost
             # num anchor * (num_gt * topk)
             topk = min(self.topk, int(len(select_cost) / num_gt))
+            if topk == 0:
+                assigned_labels = assigned_gt_inds.new_full((num_bboxes, ), -1)
+                assign_result = AssignResult(
+                    num_gt,
+                    assigned_gt_inds,
+                    pred_scores.new_zeros((num_bboxes,)),
+                    labels=assigned_labels)
+                assign_result.assign_metrics = pred_scores.new_zeros((0,))
+                return assign_result
             # num_anchors * (num_gt * topk)
             repeat_select_cost = select_cost[...,
                                              None].repeat(1, 1, topk).view(

@@ -88,10 +88,6 @@ class DOTADataset(BaseDataset):
                 with open(txt_file) as f:
                     s = f.readlines()
                     for si in s:
-                        si = si.strip().lstrip('\ufeff')
-                        if (not si or si.lower().startswith('imagesource')
-                                or si.lower().startswith('gsd')):
-                            continue
                         instance = {}
                         bbox_info = si.split()
                         instance['bbox'] = [float(i) for i in bbox_info[:8]]

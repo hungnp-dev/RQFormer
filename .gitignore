@@ -1,0 +1,16 @@
+# datasets
+data/
+
+# model weights
+checkpoints/
+*.pth
+*.pt
+
+# training/testing outputs
+work_dirs/
+*.pkl
+*.pickle
+
+# cache
+__pycache__/
+*.pyc

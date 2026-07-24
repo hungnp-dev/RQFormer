@@ -118,7 +118,7 @@ def add_mim_extension():
     else:
         return
 
-    filenames = ['tools', 'configs']
+    filenames = ['tools', 'configs', 'demo', 'model-index.yml']
     repo_path = osp.dirname(__file__)
     mim_path = osp.join(repo_path, 'mmrotate', '.mim')
     os.makedirs(mim_path, exist_ok=True)
@@ -171,7 +171,7 @@ if __name__ == '__main__':
         author_email='openmmlab@gmail.com',
         keywords='computer vision, object detection, rotation detection',
         url='https://github.com/open-mmlab/mmrotate',
-        packages=find_packages(exclude=('configs', 'tools')),
+        packages=find_packages(exclude=('configs', 'tools', 'demo')),
         include_package_data=True,
         classifiers=[
             'Development Status :: 4 - Beta',
@@ -187,6 +187,7 @@ if __name__ == '__main__':
         install_requires=parse_requirements('requirements/runtime.txt'),
         extras_require={
             'all': parse_requirements('requirements.txt'),
+            'tests': parse_requirements('requirements/tests.txt'),
             'build': parse_requirements('requirements/build.txt'),
             'optional': parse_requirements('requirements/optional.txt'),
             'mim': parse_requirements('requirements/mminstall.txt'),

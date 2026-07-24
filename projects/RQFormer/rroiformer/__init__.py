@@ -5,6 +5,12 @@ from .rroiformer_decoder_layer import RRoIFormerDecoderLayer
 from .match_cost import RBBoxL1Cost, RotatedIoUCost
 from .rroiattention import RRoIAttention
 from .TopkHungarianAssigner import TopkHungarianAssigner
+from .oriented_dii_head import OrientedDIIHead
+from .oriented_sparse_roi_head import OrientedSparseRoIHead
+from .rroiattn_decoder_layer import RRoIAttnDecoderLayer
+from .icdar2015 import ICDAR15Dataset
+from .icdar2015_metric import ICDAR2015Metric
+from .cpsq import CPSQ
 
 __all__ = [
     'OrientedDDQRCNN',
@@ -15,4 +21,11 @@ __all__ = [
     'RotatedIoUCost',
     'RRoIAttention',
     'TopkHungarianAssigner',
+    'OrientedDIIHead',
+    'OrientedSparseRoIHead',
+    'RRoIAttnDecoderLayer',
+    'ICDAR15Dataset',
+    'ICDAR2015Metric',
+    'CPSQ'
+
 ]
